@@ -1,0 +1,222 @@
+#!/usr/bin/env perl
+#
+## @author Robin Schneider <ypid@riseup.net>
+## @company hamcos IT Service GmbH http://www.hamcos.de
+## @license AGPLv3 <https://www.gnu.org/licenses/agpl-3.0.html>
+
+# Documentation {{{
+
+=encoding UTF-8
+=head1 NAME
+
+IMC-mail-extract - Parse Report Email from IMC and extract the attached CSV file for further processing.
+
+=head1 DESCRIPTION
+
+Written to parse a report Email from IMC containing a CSV file and process the file on another system.
+The script expects the mail either from STDIN or as filename in it’s parameter list.
+
+=head1 USAGE
+
+IMC-mail-extract --remote icinga@monitoring-collector
+
+=head1 OPTIONS
+
+=over
+
+=item -r|--remote
+
+[<username>]@<hostname>[:<port>] of the remote server where the
+IMC-DNS-mon-comparison script will be executed.
+Your F<ssh_config> file will be considered for further expansion.
+
+=item -s|--remote-script
+
+File path of the script to be executed on the remote server.
+The file path to the CSV file will be appended as last option.
+
+=item -d|--remote-data
+
+File path where the CSV file will be saved to on the remote server.
+
+=item -o|--output-file
+
+Write the CSV file instead of copying it to the remote and processing it there.
+
+=item -h|--help
+
+Print help page and exit.
+
+=item -V|--version
+
+Print version and exit.
+
+=back
+
+=head1 REQUIRED ARGUMENTS
+
+--remote
+
+=head1 DEPENDENCIES
+
+Required modules:
+
+    Email::MIME
+    Net::OpenSSH
+
+Debian packages:
+
+    libemail-mime-perl libnet-openssh-perl
+
+CPAN:
+
+    Email::MIME Net::OpenSSH
+
+=head1 CONFIGURATION
+
+None
+
+=head1 EXIT STATUS
+
+0   No errors occurred and no deviations could be found.
+
+2   Any other error which which caused the script to die.
+
+=head1 DIAGNOSTICS
+
+Useful options for diagnostics:
+
+    --output-file
+
+Also, spin up the test framework which uses Bats.
+
+=head1 BUGS AND LIMITATIONS
+
+None that I know of. Submit patches if you find bugs :)
+
+=head1 INCOMPATIBILITIES
+
+None that I am aware of.
+
+=head1 AUTHOR
+
+Robin Schneider <robin.schneider@hamcos.de>
+
+=head1 LICENSE AND COPYRIGHT
+
+Copyright (C) 2015 Robin Schneider <robin.schneider@hamcos.de>
+
+hamcos IT Service GmbH http://www.hamcos.de
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as
+published by the Free Software Foundation, version 3 of the
+License.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
+
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+=cut
+
+# }}}
+
+# Preamble {{{
+use strict;
+use warnings;
+use autodie;
+use English qw( -no_match_vars );
+use utf8;
+use Encode qw(decode encode);
+binmode( STDOUT, ':encoding(UTF-8)' );
+use feature qw(say);
+
+use Getopt::Long qw(:config no_ignore_case bundling);
+use Pod::Usage;
+use File::Temp;
+
+use Email::MIME;
+
+use Net::OpenSSH;
+# }}}
+
+use version; our $VERSION = qv('0.9.0');
+
+## Command-line arguments {{{
+my $opt = {
+    remote_script => '/usr/local/bin/IMC-DNS-mon-comparison.d/evaluate_and_send_mail',
+    remote_data   => '/var/spool/IMC-mail-extract/IMC-report.csv',
+};
+GetOptions(
+    "r|remote=s"        => \$opt->{remote},
+    "s|remote-script:s" => \$opt->{remote_script},
+    "d|remote-data:s"   => \$opt->{remote_data},
+    "o|output-file:s"   => \$opt->{output_file},
+    'h|help|?'          => sub { pod2usage(1) },
+    'version|V'         => sub { say "Version: $VERSION"; exit(0) },
+);
+die pod2usage(1) if ( not $opt->{output_file} and not $opt->{remote} );
+## }}}
+
+my $raw_mail = do { local $INPUT_RECORD_SEPARATOR = undef; <> };
+my @csv_strings;
+
+## Getting the CSV file attachment from mail {{{
+my $parsed = Email::MIME->new($raw_mail);
+
+for my $part ( $parsed->parts ) {
+    if ( defined $part->filename and $part->filename =~ m/\.csv$/xms ) {
+        push( @csv_strings, $part->body );
+    }
+}
+unless ( scalar @csv_strings ) {
+    die 'Missing CSV file attachment.';
+}
+if ( scalar @csv_strings != 1 ) {
+    die 'Can handle more than one CSV file currently.';
+}
+## }}}
+
+if ( $opt->{output_file} ) {
+
+    ## Write CSV attachment to file {{{
+    open( my $out_fh, '>', $opt->{output_file} );
+    print $out_fh $csv_strings[0];
+    close($out_fh);
+    ## }}}
+
+}
+else {
+
+    ## Copying CSV attachment to remote and scheduling it to be parsed there {{{
+    my $ssh = Net::OpenSSH->new( $opt->{remote}, default_encoding => 'UTF-8' );
+    $ssh->die_on_error("unable to connect");
+
+    foreach my $csv_string (@csv_strings) {
+        my $tmp_file = File::Temp->new();
+        print $tmp_file $csv_string;
+        $tmp_file->flush;
+
+        $ssh->scp_put( $tmp_file->filename, $opt->{remote_data} ) or die $ssh->error;
+
+        ## Wired encoding issue on the SLES production system. In development it worked using Debian Jessie.
+        # $ssh->system( { stdin_data => $csv_string }, "cat 1> $opt->{remote_data}" ) or die $ssh->error;
+
+        print "Scheduling job on $opt->{remote}: ";
+        my ( $at_out, $at_err ) =
+            $ssh->capture2( { stdin_data => "$opt->{remote_script} $opt->{remote_data}" }, "at now" );
+
+        ## no critic qw(RegularExpressions::RequireExtendedFormatting)
+        $at_err =~ s#warning: commands will be executed using /bin/sh\n##ms;
+        ## `at` always printed this message to STDERR.
+
+        $ssh->error and die $ssh->error;
+        print $at_err;
+    } ## end foreach my $csv_string (@csv_strings)
+    ## }}}
+
+} ## end else [ if ( $opt->{output_file...})]
